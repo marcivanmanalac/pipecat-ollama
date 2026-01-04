@@ -48,11 +48,20 @@ from pipecat.processors.aggregators.llm_response_universal import LLMContextAggr
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+#from pipecat.services.cartesia.tts import CartesiaTTSService
+#from pipecat.services.deepgram.stt import DeepgramSTTService
+#from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
+
+#ADDED STT, TTS, & LLM Services
+from pipecat.services.ollama.llm import OLLamaLLMService
+from pipecat.services.whisper.stt import WhisperSTTService
+from pipecat.services.piper.tts import PiperTTSService
+#ADDED 100% local audio
+from pipecat.transports.local.audio import LocalAudioTransport, LocalAudioTransportParams
+#ADDED TTS local web server setup
+import aiohttp
 
 logger.info("✅ All components loaded successfully!")
 
@@ -61,69 +70,79 @@ load_dotenv(override=True)
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"Starting bot")
+    
+    # Create a session for the HTTP requests
+    async with aiohttp.ClientSession() as session:
+        
+        # 1. Configure LLM (Ollama)
+        llm = OLLamaLLMService(
+            model="llama3.2:1b",
+            base_url="http://localhost:11434/v1"
+        )
 
-    stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+        # 2. Configure STT (Whisper - Local)
+        #stt = WhisperSTTService() 
+        # Force Whisper to use the CPU to avoid NVIDIA driver errors
+        stt = WhisperSTTService(device="cpu")
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="71a7ad14-091c-4e8e-a314-022ece01c121",  # British Reading Lady
-    )
+        # 3. Configure TTS (Piper - HTTP Client)
+        tts = PiperTTSService(
+            aiohttp_session=session,  # <--- REQUIRED
+            base_url="http://localhost:5000", # <--- REQUIRED
+            voice="en_US-lessac-medium"
+        )
 
-    llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
-
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a friendly AI assistant. Respond naturally and keep your answers conversational.",
-        },
-    ]
-
-    context = LLMContext(messages)
-    context_aggregator = LLMContextAggregatorPair(context)
-
-    rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
-
-    pipeline = Pipeline(
-        [
-            transport.input(),  # Transport user input
-            rtvi,  # RTVI processor
-            stt,
-            context_aggregator.user(),  # User responses
-            llm,  # LLM
-            tts,  # TTS
-            transport.output(),  # Transport bot output
-            context_aggregator.assistant(),  # Assistant spoken responses
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a friendly AI assistant. Keep answers short and conversational.",
+            },
         ]
-    )
 
-    task = PipelineTask(
-        pipeline,
-        params=PipelineParams(
-            enable_metrics=True,
-            enable_usage_metrics=True,
-        ),
-        observers=[RTVIObserver(rtvi)],
-    )
+        context = LLMContext(messages)
+        context_aggregator = LLMContextAggregatorPair(context)
 
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        logger.info(f"Client connected")
-        # Kick off the conversation.
-        messages.append({"role": "system", "content": "Say hello and briefly introduce yourself."})
-        await task.queue_frames([LLMRunFrame()])
+        rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected")
-        await task.cancel()
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                rtvi,
+                stt,
+                context_aggregator.user(),
+                llm,
+                tts,
+                transport.output(),
+                context_aggregator.assistant(),
+            ]
+        )
 
-    runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+        task = PipelineTask(
+            pipeline,
+            params=PipelineParams(
+                enable_metrics=True,
+                enable_usage_metrics=True,
+            ),
+            observers=[RTVIObserver(rtvi)],
+        )
 
-    await runner.run(task)
+        @transport.event_handler("on_client_connected")
+        async def on_client_connected(transport, client):
+            logger.info(f"Client connected")
+            messages.append({"role": "system", "content": "Say hello."})
+            await task.queue_frames([LLMRunFrame()])
 
+        @transport.event_handler("on_client_disconnected")
+        async def on_client_disconnected(transport, client):
+            logger.info(f"Client disconnected")
+            await task.cancel()
+
+        runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
+
+        await runner.run(task)
 
 async def bot(runner_args: RunnerArguments):
-    """Main bot entry point for the bot starter."""
+    # ... existing code ...
 
     transport_params = {
         "daily": lambda: DailyParams(
@@ -132,20 +151,49 @@ async def bot(runner_args: RunnerArguments):
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
             turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
-        "webrtc": lambda: TransportParams(
-            audio_in_enabled=True,
+        # ADD THIS BLOCK FOR LOCAL AUDIO:
+        "local": lambda: LocalAudioTransportParams(
+            audio_out_sample_rate=16000,
             audio_out_enabled=True,
+            audio_in_enabled=True,
             vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
-            turn_analyzer=LocalSmartTurnAnalyzerV3(),
         ),
     }
 
     transport = await create_transport(runner_args, transport_params)
+    await run_bot(transport, runner_args)
 
+
+
+async def main():
+    """Manual entry point for running locally without the CLI parser."""
+    
+    # 1. Define the Local Transport directly (No 'create_transport' helper needed)
+    #    Note: We use the 'TransportParams' suffix you fixed earlier
+    transport = LocalAudioTransport(
+        params=LocalAudioTransportParams(
+            audio_out_sample_rate=16000,
+            audio_out_enabled=True,
+            audio_in_enabled=True,
+            vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        )
+    )
+
+    # 2. Create a dummy object for runner_args since run_bot expects it
+    #    (This just tells the runner to handle Ctrl+C strictly)
+    class DummyRunnerArgs:
+        handle_sigint = True
+    
+    runner_args = DummyRunnerArgs()
+
+    # 3. Run the bot
     await run_bot(transport, runner_args)
 
 
 if __name__ == "__main__":
-    from pipecat.runner.run import main
-
-    main()
+    import asyncio
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
